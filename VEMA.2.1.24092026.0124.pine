@@ -1,0 +1,252 @@
+// ═════════════════════════════════════════════════════════════════════════════
+// Author Name : Subhasom Mandal
+// GitHub      : https://github.com/Subhasom
+// Date        : Thursday 24th Sep 2026
+// Release     : 2.1.24092026.0124
+// Description : VEMA — a volatility-window indicator. For every bar it
+//               compares ATR with its own EMA baseline and opens a
+//               high-volatility window when ATR expands, confirmed by a
+//               MACD histogram impulse and a Historical Volatility (HV)
+//               expansion. Each window is shaded on the price chart, its
+//               highest high and lowest low are labelled, the % change
+//               from start to end is printed on it, and the last window's
+//               High/Low are extended as dashed levels. From the latest
+//               bar it projects the HV expected range (±σ) as grey lines
+//               to the session close. Alerts fire when a window opens and
+//               when it closes.
+// ═════════════════════════════════════════════════════════════════════════════
+//@version=6
+indicator("VEMA", "VEMA", overlay = false, max_labels_count = 500, max_boxes_count = 500, max_lines_count = 500)
+
+// ─────────────────────────────── ATR inputs ───────────────────────────────
+const string G_ATR = "ATR – volatility regime"
+int    atrLenInput    = input.int(14, "ATR length", 1, group = G_ATR)
+string atrSmoothInput = input.string("RMA", "ATR smoothing", ["RMA", "SMA", "EMA", "WMA"], group = G_ATR)
+bool   gapInput       = input.bool(true, "Count session-open gaps in True Range", group = G_ATR, tooltip = "When off, the first bar of each session uses High - Low only, so overnight gaps do not open a volatility window by themselves.")
+int    baseLenInput   = input.int(50, "Baseline EMA length (of ATR)", 1, group = G_ATR, tooltip = "ATR is compared to an EMA of itself. The ratio ATR / baseline is plotted in the indicator pane.")
+float  enterInput     = input.float(1.30, "Open window when ATR > baseline ×", 0.1, step = 0.05, group = G_ATR)
+float  exitInput      = input.float(1.05, "Close window when ATR < baseline ×", 0.1, step = 0.05, group = G_ATR, tooltip = "Keep this below the open level. The gap between the two prevents a window from flickering on and off.")
+
+// ─────────────────────────────── MACD inputs ──────────────────────────────
+const string G_MACD = "MACD – momentum confirmation"
+bool   macdFilterInput = input.bool(true, "Require MACD impulse to open a window", group = G_MACD)
+float  sourceInput     = input.source(close, "Source", group = G_MACD)
+int    fastLenInput    = input.int(12, "Fast length", 1, group = G_MACD)
+int    slowLenInput    = input.int(26, "Slow length", 1, group = G_MACD)
+int    sigLenInput     = input.int(9, "Signal length", 1, group = G_MACD)
+string oscTypeInput    = input.string("EMA", "Oscillator MA type", ["EMA", "SMA"], group = G_MACD, display = display.none)
+string sigTypeInput    = input.string("EMA", "Signal MA type", ["EMA", "SMA"], group = G_MACD, display = display.none)
+int    impLenInput     = input.int(50, "Impulse baseline length", 1, group = G_MACD)
+float  impMultInput    = input.float(1.5, "Impulse: |histogram| > its average ×", 0.1, step = 0.1, group = G_MACD, tooltip = "Direction-agnostic: a sharp move up or down both count as an impulse.")
+int    impLookInput    = input.int(3, "Impulse allowed within last N bars", 0, group = G_MACD, tooltip = "ATR lags MACD, so the impulse may appear a few bars before ATR crosses the open level.")
+
+// ─────────────────────────────── HV inputs ────────────────────────────────
+const string G_HV = "Historical Volatility"
+bool  hvFilterInput  = input.bool(true, "Require HV expansion to open a window", group = G_HV)
+int   hvLenInput     = input.int(10, "HV length", 1, group = G_HV)
+int   hvBaseLenInput = input.int(50, "HV baseline EMA length", 1, group = G_HV)
+float hvMultInput    = input.float(1.30, "HV expansion: HV > baseline ×", 0.1, step = 0.05, group = G_HV, tooltip = "HV is compared to an EMA of itself, so the annualisation factor does not affect the signal.")
+int   hvLookInput    = input.int(3, "HV expansion allowed within last N bars", 0, group = G_HV)
+bool  projInput      = input.bool(true, "Project HV expected range to end of day", group = G_HV, tooltip = "Grey lines from the last bar to the session close at: close × e^(±k · σ_bar · √bars remaining), where σ_bar is the per-bar standard deviation of log returns over the HV length.")
+float projMultInput  = input.float(1.0, "Projection width (σ)", 0.1, step = 0.1, group = G_HV, tooltip = "1σ ≈ 68% of outcomes, 2σ ≈ 95%, assuming returns stay as volatile as the recent HV.")
+color projColInput   = input.color(#9598a1, "Projection line colour", group = G_HV)
+
+// ─────────────────────────────── Window inputs ────────────────────────────
+const string G_WIN = "Window"
+int minBarsInput = input.int(3, "Minimum window length (bars)", 1, group = G_WIN, tooltip = "Windows shorter than this are removed once they close.")
+
+// ─────────────────────────────── Display inputs ───────────────────────────
+const string G_DSP = "Display"
+bool  showBoxInput    = input.bool(true, "Shade window range on price chart", group = G_DSP)
+bool  showPctInput    = input.bool(true, "Show % change (start → end) on window", group = G_DSP, tooltip = "Start = open of the window's first bar. End = close of its last bar. Requires the window shading to be on.")
+bool  showLabelsInput = input.bool(true, "Label window High / Low", group = G_DSP)
+bool  showLevelsInput = input.bool(true, "Extend last window's High / Low to the right", group = G_DSP)
+bool  showBgInput     = input.bool(true, "Highlight window in indicator pane", group = G_DSP)
+color hiColInput      = input.color(#ff5252, "High marker / negative change", group = G_DSP)
+color loColInput      = input.color(#26a69a, "Low marker / positive change", group = G_DSP)
+color boxColInput     = input.color(color.new(#ffb74d, 88), "Window fill", group = G_DSP)
+
+// ─────────────────────────────── ATR (from ATR script) ────────────────────
+maAtr(float source, int length) =>
+    switch atrSmoothInput
+        "RMA" => ta.rma(source, length)
+        "SMA" => ta.sma(source, length)
+        "EMA" => ta.ema(source, length)
+        => ta.wma(source, length)
+
+float trRaw   = ta.tr(true)
+float trVal   = not gapInput and session.isfirstbar ? high - low : trRaw
+float atr     = maAtr(trVal, atrLenInput)
+float atrBase = ta.ema(atr, baseLenInput)
+float ratio   = atrBase > 0 ? atr / atrBase : na
+
+// ─────────────────────────────── MACD (from MACD script) ──────────────────
+ma(float source, int length, simple string maType) =>
+    switch maType
+        "EMA" => ta.ema(source, length)
+        "SMA" => ta.sma(source, length)
+
+float maFast   = ma(sourceInput, fastLenInput, oscTypeInput)
+float maSlow   = ma(sourceInput, slowLenInput, oscTypeInput)
+float macd     = maFast - maSlow
+float signal   = ma(macd, sigLenInput, sigTypeInput)
+float hist     = macd - signal
+float absHist  = math.abs(hist)
+float histAvg  = ta.ema(absHist, impLenInput)
+bool  impulse  = absHist > histAvg * impMultInput
+int   sinceImp = ta.barssince(impulse)
+bool  macdOK   = not macdFilterInput or (not na(sinceImp) and sinceImp <= impLookInput)
+
+// ─────────────────────────────── HV (from HV script) ──────────────────────
+float annual   = 365
+float per      = timeframe.isintraday or timeframe.isdaily and timeframe.multiplier == 1 ? 1 : 7
+float sigmaBar = ta.stdev(math.log(close / close[1]), hvLenInput)   // per-bar σ of log returns
+float hv       = 100 * sigmaBar * math.sqrt(annual / per)
+float hvBase   = ta.ema(hv, hvBaseLenInput)
+float hvRatio  = hvBase > 0 ? hv / hvBase : na
+bool  hvExpand = hvRatio > hvMultInput
+int   sinceHv  = ta.barssince(hvExpand)
+bool  hvOK     = not hvFilterInput or (not na(sinceHv) and sinceHv <= hvLookInput)
+
+// @function Formats the % change from `a` to `b` with a sign.
+pctText(float a, float b) =>
+    float p = (b - a) / a * 100
+    (p >= 0 ? "+" : "") + str.tostring(p, "0.00") + "%"
+
+// ─────────────────────────────── Window state machine ─────────────────────
+bool enterCond = ratio > enterInput and macdOK and hvOK
+bool stayCond  = ratio >= exitInput
+
+var bool  inWin      = false
+var int   startBar   = na
+var float startPrice = na
+var float endPrice   = na
+var float winHi      = na
+var float winLo      = na
+var int   hiBar      = na
+var int   loBar      = na
+var box   winBox     = na
+var label hiLbl      = na
+var label loLbl      = na
+var line  hiLine     = na
+var line  loLine     = na
+
+bool opened = false
+bool closed = false
+
+if not inWin and enterCond
+    inWin      := true
+    opened     := true
+    startBar   := bar_index
+    startPrice := open
+    endPrice   := close
+    winHi      := high
+    winLo      := low
+    hiBar      := bar_index
+    loBar      := bar_index
+    if showBoxInput
+        winBox := box.new(bar_index, winHi, bar_index, winLo, border_color = color.new(#ffb74d, 50), border_style = line.style_dotted, bgcolor = boxColInput, text_size = size.small, text_halign = text.align_center, text_valign = text.align_top, force_overlay = true)
+    if showLabelsInput
+        hiLbl := label.new(hiBar, winHi, "", style = label.style_label_down, color = hiColInput, textcolor = color.white, size = size.small, force_overlay = true)
+        loLbl := label.new(loBar, winLo, "", style = label.style_label_up, color = loColInput, textcolor = color.white, size = size.small, force_overlay = true)
+else if inWin
+    if stayCond
+        endPrice := close
+        if high > winHi
+            winHi := high
+            hiBar := bar_index
+        if low < winLo
+            winLo := low
+            loBar := bar_index
+    else
+        inWin  := false
+        closed := true
+
+// Keep the live window's drawings in sync while it is open.
+if inWin
+    if showBoxInput and not na(winBox)
+        box.set_right(winBox, bar_index)
+        box.set_top(winBox, winHi)
+        box.set_bottom(winBox, winLo)
+        if showPctInput
+            box.set_text(winBox, pctText(startPrice, endPrice) + " (live)")
+            box.set_text_color(winBox, endPrice >= startPrice ? loColInput : hiColInput)
+    if showLabelsInput and not na(hiLbl)
+        label.set_xy(hiLbl, hiBar, winHi)
+        label.set_text(hiLbl, "H " + str.tostring(winHi, format.mintick))
+        label.set_xy(loLbl, loBar, winLo)
+        label.set_text(loLbl, "L " + str.tostring(winLo, format.mintick))
+
+// Finalise (or discard) the window when it closes.
+int  winLen    = closed ? bar_index - startBar : 0
+bool qualified = closed and winLen >= minBarsInput
+
+if closed
+    if not qualified
+        if not na(winBox)
+            box.delete(winBox)
+        if not na(hiLbl)
+            label.delete(hiLbl)
+        if not na(loLbl)
+            label.delete(loLbl)
+    else
+        string chg = pctText(startPrice, endPrice)
+        string tip = "High-volatility window\n" + str.tostring(winLen) + " bars\nStart " + str.tostring(startPrice, format.mintick) + " → End " + str.tostring(endPrice, format.mintick) + "  (" + chg + ")\nHigh " + str.tostring(winHi, format.mintick) + "   Low " + str.tostring(winLo, format.mintick) + "\nLow → High swing " + pctText(winLo, winHi)
+        if showBoxInput and showPctInput and not na(winBox)
+            box.set_text(winBox, chg + "\n" + str.tostring(startPrice, format.mintick) + " → " + str.tostring(endPrice, format.mintick))
+        if showLabelsInput and not na(hiLbl)
+            label.set_tooltip(hiLbl, tip)
+            label.set_tooltip(loLbl, tip)
+        if showLevelsInput
+            if not na(hiLine)
+                line.delete(hiLine)
+            if not na(loLine)
+                line.delete(loLine)
+            hiLine := line.new(hiBar, winHi, bar_index, winHi, extend = extend.right, color = hiColInput, style = line.style_dashed, force_overlay = true)
+            loLine := line.new(loBar, winLo, bar_index, winLo, extend = extend.right, color = loColInput, style = line.style_dashed, force_overlay = true)
+
+// ─────────────────────────────── HV projection to end of day ──────────────
+var line  projUp  = na
+var line  projDn  = na
+var label projUpL = na
+var label projDnL = na
+
+if barstate.islast and projInput and timeframe.isintraday
+    int   dayEnd   = time_close("D")
+    float barMs    = timeframe.in_seconds() * 1000.0
+    int   barsLeft = na(dayEnd) ? 0 : math.max(int(math.round((dayEnd - time_close) / barMs)), 0)
+    if barsLeft > 0 and not na(sigmaBar)
+        float move = projMultInput * sigmaBar * math.sqrt(barsLeft)
+        float up   = close * math.exp(move)
+        float dn   = close * math.exp(-move)
+        string sig = str.tostring(projMultInput, "0.#") + "σ"
+        string upT = "HV +" + sig + " EOD  " + str.tostring(up, format.mintick) + "  (" + pctText(close, up) + ")"
+        string dnT = "HV −" + sig + " EOD  " + str.tostring(dn, format.mintick) + "  (" + pctText(close, dn) + ")"
+        if na(projUp)
+            projUp  := line.new(time, up, dayEnd, up, xloc = xloc.bar_time, color = projColInput, style = line.style_dashed, width = 1, force_overlay = true)
+            projDn  := line.new(time, dn, dayEnd, dn, xloc = xloc.bar_time, color = projColInput, style = line.style_dashed, width = 1, force_overlay = true)
+            projUpL := label.new(dayEnd, up, upT, xloc = xloc.bar_time, style = label.style_label_left, color = color.new(color.black, 100), textcolor = projColInput, size = size.small, force_overlay = true)
+            projDnL := label.new(dayEnd, dn, dnT, xloc = xloc.bar_time, style = label.style_label_left, color = color.new(color.black, 100), textcolor = projColInput, size = size.small, force_overlay = true)
+        else
+            line.set_xy1(projUp, time, up)
+            line.set_xy2(projUp, dayEnd, up)
+            line.set_xy1(projDn, time, dn)
+            line.set_xy2(projDn, dayEnd, dn)
+            label.set_xy(projUpL, dayEnd, up)
+            label.set_text(projUpL, upT)
+            label.set_xy(projDnL, dayEnd, dn)
+            label.set_text(projDnL, dnT)
+
+// ─────────────────────────────── Indicator pane ───────────────────────────
+hline(1.0, "Baseline", color.new(#787b86, 60), hline.style_dotted)
+hline(enterInput, "ATR open level", color.new(#ff5252, 40), hline.style_dashed)
+hline(exitInput, "ATR close level", color.new(#ffb74d, 40), hline.style_dashed)
+hline(hvMultInput, "HV confirm level", color.new(#2962ff, 50), hline.style_dotted)
+plot(ratio, "ATR / baseline", inWin ? #ff5252 : #b2b5be, 2)
+plot(hvRatio, "HV / baseline", color.new(#2962ff, 20), 1)
+plotshape(macdFilterInput and impulse, "MACD impulse", shape.circle, location.bottom, color.new(#ff6d00, 20), size = size.tiny)
+bgcolor(showBgInput and inWin ? color.new(#ff5252, 88) : na, title = "Window highlight")
+
+// ─────────────────────────────── Alerts ───────────────────────────────────
+alertcondition(opened, "HV window opened", "VEMA: high-volatility window opened on {{ticker}}")
+alertcondition(qualified, "HV window closed", "VEMA: high-volatility window closed on {{ticker}} — H/L and % change marked")
